@@ -57,6 +57,18 @@ async def async_setup_entry(
 
 
 @callback
+def garage_door_supported_fn(hub: AlarmHub, resource_id: str) -> bool:
+    """Check if the resource is a garage door."""
+    return hub.api.garage_doors.get(resource_id) is not None
+
+
+@callback
+def gate_supported_fn(hub: AlarmHub, resource_id: str) -> bool:
+    """Check if the resource is a gate."""
+    return hub.api.gates.get(resource_id) is not None
+
+
+@callback
 def is_closed_fn(
     controller: pyadc.GarageDoorController | pyadc.GateController, door_id: str
 ) -> bool | None:
@@ -123,6 +135,7 @@ ENTITY_DESCRIPTIONS: list[AdcEntityDescription] = [
     AdcCoverEntityDescription[pyadc.garage_door.GarageDoor, pyadc.GarageDoorController](
         key="garage_door",
         controller_fn=lambda hub, _: hub.api.garage_doors,
+        supported_fn=garage_door_supported_fn,
         is_closed_fn=is_closed_fn,
         device_class_fn=device_class_fn,
         supported_features_fn=supported_features_fn,
@@ -131,6 +144,7 @@ ENTITY_DESCRIPTIONS: list[AdcEntityDescription] = [
     AdcCoverEntityDescription[pyadc.gate.Gate, pyadc.GateController](
         key="gate",
         controller_fn=lambda hub, _: hub.api.gates,
+        supported_fn=gate_supported_fn,
         is_closed_fn=is_closed_fn,
         device_class_fn=device_class_fn,
         supported_features_fn=supported_features_fn,
