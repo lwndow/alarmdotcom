@@ -1,12 +1,17 @@
 """The alarmdotcom integration."""
 
+from __future__ import annotations
+
 import logging
+from collections.abc import Mapping
+from typing import Any, Callable
 
 import aiohttp
 import pyalarmdotcomajax as pyadc
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from mashumaro.exceptions import InvalidFieldValue
 
 from .const import (
     CONF_ARM_AWAY,
@@ -24,6 +29,146 @@ from .const import (
 from .hub import AlarmHub
 
 LOGGER = logging.getLogger(__name__)
+_FAN_PATCH_VERSION = "9"
+_FAN_PATCH_LOG_COUNT = 0
+
+
+def _patch_pyalarmdotcomajax_fan_mode_deserializer() -> None:
+    """Work around upstream bug where Thermostat fan mode may be null."""
+
+    try:
+        from pyalarmdotcomajax.models import base as base_models
+        from pyalarmdotcomajax.models import thermostat as thermostat_models
+    except ImportError:  # pragma: no cover - safety fallback
+        LOGGER.debug("Alarm.com fan patch: unable to import thermostat models.")
+        return
+
+    if (
+        getattr(thermostat_models.ThermostatAttributes, "_alarmdotcom_fan_mode_patch", None) == _FAN_PATCH_VERSION
+        and getattr(base_models.AdcResource, "_alarmdotcom_fan_mode_patch", None) == _FAN_PATCH_VERSION
+    ):
+        return
+
+    original_missing = getattr(thermostat_models.ThermostatReportedFanMode, "_missing_", None)
+
+    @classmethod
+    def _fan_mode_missing_(cls: type[thermostat_models.ThermostatReportedFanMode], value: object):
+        if value is None:
+            return cls.AUTO_LOW
+        if original_missing is not None:
+            return original_missing(cls, value)  # type: ignore[misc]
+        raise ValueError(f"{value!r} is not a valid {cls.__name__}")
+
+    thermostat_models.ThermostatReportedFanMode._missing_ = _fan_mode_missing_  # type: ignore[assignment]
+
+    original_from_dict = thermostat_models.ThermostatAttributes.__mashumaro_from_dict__.__func__
+    original_adc_post_init: Callable[[base_models.AdcResource], None] = base_models.AdcResource.__post_init__
+
+    def _sanitize_payload(
+        data: Any,
+        *,
+        set_missing_keys: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, str]] | None:
+        payload_dict: dict[str, Any] | None = None
+
+        if isinstance(data, Mapping):
+            payload_dict = dict(data)
+        elif hasattr(data, "items"):
+            try:
+                payload_dict = dict(data.items())  # type: ignore[attr-defined]
+            except TypeError:
+                payload_dict = None
+        elif hasattr(data, "to_dict"):
+            try:
+                payload_dict = dict(data.to_dict())
+            except (TypeError, AttributeError):
+                payload_dict = None
+
+        if payload_dict is None:
+            return None
+
+        cleaned_details: dict[str, str] = {}
+
+        fallback_fan_value = thermostat_models.ThermostatReportedFanMode.AUTO_LOW.value
+
+        for key in ("fan_mode", "fanMode"):
+            if key in payload_dict and payload_dict[key] is None:
+                payload_dict[key] = fallback_fan_value
+                cleaned_details[key] = "set AUTO_LOW"
+            elif set_missing_keys and key not in payload_dict:
+                payload_dict[key] = fallback_fan_value
+                cleaned_details[key] = "added AUTO_LOW"
+
+        for key in ("desired_fan_mode", "desiredFanMode"):
+            if key in payload_dict and payload_dict[key] is None:
+                payload_dict.pop(key, None)
+                cleaned_details[key] = "removed"
+
+        if cleaned_details:
+            return payload_dict, cleaned_details
+
+        return None
+
+    @classmethod
+    def _patched_from_dict(
+        cls: type[thermostat_models.ThermostatAttributes],
+        data_dict: dict[str, Any] | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> thermostat_models.ThermostatAttributes:
+        payload = data_dict
+
+        if sanitized := _sanitize_payload(payload):
+            payload, cleaned_keys = sanitized
+            global _FAN_PATCH_LOG_COUNT
+            if _FAN_PATCH_LOG_COUNT < 5:
+                LOGGER.debug(
+                    "Alarm.com fan patch sanitized %s from payload type %s",
+                    ", ".join(f"{k} ({v})" for k, v in sorted(cleaned_keys.items())),
+                    type(data_dict),
+                )
+                _FAN_PATCH_LOG_COUNT += 1
+
+        try:
+            return original_from_dict(cls, payload, *args, **kwargs)
+        except InvalidFieldValue as err:
+            if "fan_mode" not in str(err):
+                raise
+
+            if sanitized := _sanitize_payload(payload):
+                payload, cleaned_keys = sanitized
+                LOGGER.debug(
+                    "Alarm.com fan patch retried after InvalidFieldValue; removed %s",
+                    ", ".join(f"{k} ({v})" for k, v in sorted(cleaned_keys.items())),
+                )
+                return original_from_dict(cls, payload, *args, **kwargs)
+
+            raise
+
+    thermostat_models.ThermostatAttributes.__mashumaro_from_dict__ = _patched_from_dict
+    setattr(thermostat_models.ThermostatAttributes, "_alarmdotcom_fan_mode_patch", _FAN_PATCH_VERSION)
+    LOGGER.debug("Alarm.com fan patch: Applied fallback for null thermostat fan_mode.")
+
+    def _patched_adc_post_init(self: base_models.AdcResource) -> None:
+        if getattr(self, "attributes_type", None) is thermostat_models.ThermostatAttributes:
+            if sanitized := _sanitize_payload(
+                getattr(self.api_resource, "attributes", None),
+                set_missing_keys=True,
+            ):
+                cleaned_attrs, cleaned_keys = sanitized
+                self.api_resource.attributes = cleaned_attrs
+                LOGGER.debug(
+                    "Alarm.com fan patch sanitized resource attributes before init (%s)",
+                    ", ".join(f"{k} ({v})" for k, v in sorted(cleaned_keys.items())),
+                )
+
+        original_adc_post_init(self)
+
+    base_models.AdcResource.__post_init__ = _patched_adc_post_init
+    setattr(base_models.AdcResource, "_alarmdotcom_fan_mode_patch", _FAN_PATCH_VERSION)
+
+
+_patch_pyalarmdotcomajax_fan_mode_deserializer()
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -88,13 +233,9 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
         v2_options["use_arm_code"] = bool(config_entry.options.get("arm_code"))
 
-        v2_options["arm_code"] = (
-            str(arm_code) if (arm_code := config_entry.options.get("arm_code")) else ""
-        )
+        v2_options["arm_code"] = str(arm_code) if (arm_code := config_entry.options.get("arm_code")) else ""
 
-        hass.config_entries.async_update_entry(
-            config_entry, data={**config_entry.data}, options=v2_options, version=2
-        )
+        hass.config_entries.async_update_entry(config_entry, data={**config_entry.data}, options=v2_options, version=2)
 
         LOGGER.info("Migration to version %s successful", 2)
 
@@ -157,9 +298,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
         if v3_options.get("no_entry_delay"):
             v3_options["no_entry_delay"] = None
 
-        hass.config_entries.async_update_entry(
-            config_entry, data={**config_entry.data}, options=v3_options, version=3
-        )
+        hass.config_entries.async_update_entry(config_entry, data={**config_entry.data}, options=v3_options, version=3)
 
         LOGGER.info("Migration to version %s successful", 3)
 
@@ -191,9 +330,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                     v4_options[arm_mode].remove("delay")
                     v4_options[arm_mode].append(CONF_NO_ENTRY_DELAY)
 
-        hass.config_entries.async_update_entry(
-            config_entry, data={**config_entry.data}, options=v4_options, version=4
-        )
+        hass.config_entries.async_update_entry(config_entry, data={**config_entry.data}, options=v4_options, version=4)
 
         LOGGER.info("Migration to version %s successful", 4)
 
@@ -210,9 +347,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
         v5_options.pop("update_interval", None)
         v5_options.pop("ws_reconnect_timeout", None)
 
-        hass.config_entries.async_update_entry(
-            config_entry, data={**config_entry.data}, options=v5_options, version=5
-        )
+        hass.config_entries.async_update_entry(config_entry, data={**config_entry.data}, options=v5_options, version=5)
 
         LOGGER.info("Migration to version %s successful", 5)
 

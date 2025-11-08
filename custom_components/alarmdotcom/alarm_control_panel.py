@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import logging
 import re
 from collections.abc import Callable, Coroutine, Mapping
@@ -21,6 +22,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import InvalidStateError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import DiscoveryInfoType
+from homeassistant.util import dt as dt_util
 from pyalarmdotcomajax.controllers.partitions import PartitionController
 
 from .const import (
@@ -46,6 +48,7 @@ DISARM = "disarm"
 ARM_AWAY = "arm_away"
 ARM_STAY = "arm_stay"
 ARM_NIGHT = "arm_night"
+STATE_TRANSITION_GRACE_PERIOD = timedelta(seconds=90)
 
 
 async def async_setup_entry(
@@ -102,12 +105,15 @@ def extra_state_attributes(hub: AlarmHub, partition_id: str) -> Mapping[str, Any
 
 @callback
 def state_fn(hub: AlarmHub, partition_id: str) -> AlarmControlPanelState | None:
-    """Return the state of a partition."""
+    """Return the actual reported state of a partition."""
 
     resource = hub.api.partitions[partition_id]
 
     if resource.attributes.is_malfunctioning:
         return None
+
+    if resource.attributes.has_active_alarm:
+        return AlarmControlPanelState.TRIGGERED
 
     # Mapping of PartitionState to AlarmControlPanelState
     state_mapping = {
@@ -117,17 +123,7 @@ def state_fn(hub: AlarmHub, partition_id: str) -> AlarmControlPanelState | None:
         pyadc.partition.PartitionState.ARMED_NIGHT: AlarmControlPanelState.ARMED_NIGHT,
     }
 
-    if resource.attributes.state == resource.attributes.desired_state:
-        return state_mapping.get(resource.attributes.state)
-
-    desired_state_mapping = {
-        pyadc.partition.PartitionState.DISARMED: AlarmControlPanelState.DISARMING,
-        pyadc.partition.PartitionState.ARMED_STAY: AlarmControlPanelState.ARMING,
-        pyadc.partition.PartitionState.ARMED_AWAY: AlarmControlPanelState.ARMING,
-        pyadc.partition.PartitionState.ARMED_NIGHT: AlarmControlPanelState.ARMING,
-    }
-
-    return desired_state_mapping.get(resource.attributes.desired_state) if resource.attributes.desired_state else None
+    return state_mapping.get(resource.attributes.state)
 
 
 @callback
@@ -240,6 +236,17 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
 
     entity_description: AdcAlarmControlPanelEntityDescription
 
+    def __init__(
+        self,
+        hub: AlarmHub,
+        resource_id: str,
+        description: AdcAlarmControlPanelEntityDescription[AdcManagedDeviceT, AdcControllerT],
+    ) -> None:
+        """Initialize the alarm control panel entity."""
+
+        self._state_mismatch_started_at: datetime | None = None
+        super().__init__(hub, resource_id, description)
+
     def _validate_code(self, code: str | None) -> bool:
         arm_code = self.hub.config_entry.options.get("arm_code") if hasattr(self.hub, "config_entry") else None
         if arm_code in [None, ""] or code == arm_code:
@@ -262,7 +269,60 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
         """Update entity state."""
 
         if isinstance(message, pyadc.ResourceEventMessage):
-            self.alarm_state = self.entity_description.state_fn(self.hub, self.resource_id)
+            self._update_alarm_state()
+
+    def _update_alarm_state(self) -> None:
+        """Update the cached Home Assistant alarm state."""
+
+        resource = self.hub.api.partitions[self.resource_id]
+        actual_state = self.entity_description.state_fn(self.hub, self.resource_id)
+
+        if actual_state is None:
+            self._state_mismatch_started_at = None
+            self._attr_alarm_state = None
+            return
+
+        if actual_state == AlarmControlPanelState.TRIGGERED:
+            self._state_mismatch_started_at = None
+            self._attr_alarm_state = actual_state
+            return
+
+        transition_state = self._derive_transitional_state(
+            resource.attributes.state, resource.attributes.desired_state
+        )
+
+        self._attr_alarm_state = transition_state or actual_state
+
+    def _derive_transitional_state(
+        self,
+        adc_state: pyadc.partition.PartitionState,
+        desired_state: pyadc.partition.PartitionState | None,
+    ) -> AlarmControlPanelState | None:
+        """Return the transitional alarm state, if applicable."""
+
+        if desired_state is None or adc_state == desired_state:
+            self._state_mismatch_started_at = None
+            return None
+
+        now = dt_util.utcnow()
+        if self._state_mismatch_started_at is None:
+            self._state_mismatch_started_at = now
+
+        if now - self._state_mismatch_started_at > STATE_TRANSITION_GRACE_PERIOD:
+            self._state_mismatch_started_at = None
+            return None
+
+        if desired_state == pyadc.partition.PartitionState.DISARMED:
+            return AlarmControlPanelState.DISARMING
+
+        if desired_state in (
+            pyadc.partition.PartitionState.ARMED_STAY,
+            pyadc.partition.PartitionState.ARMED_AWAY,
+            pyadc.partition.PartitionState.ARMED_NIGHT,
+        ):
+            return AlarmControlPanelState.ARMING
+
+        return None
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
