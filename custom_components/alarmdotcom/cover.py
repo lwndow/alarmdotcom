@@ -42,18 +42,18 @@ async def async_setup_entry(
     # Log discovered devices for debugging
     log.debug(
         "Setting up cover platform. Found %d garage doors and %d gates.",
-        len(hub.api.garage_doors),
-        len(hub.api.gates),
+        len(hub.api.garage_doors.items),
+        len(hub.api.gates.items),
     )
-    for device in hub.api.garage_doors:
+    for device in hub.api.garage_doors.items:
         log.debug("  - Garage door: %s (ID: %s)", device.name, device.id)
-    for device in hub.api.gates:
+    for device in hub.api.gates.items:
         log.debug("  - Gate: %s (ID: %s)", device.name, device.id)
 
     entities = [
         AdcCoverEntity(hub=hub, resource_id=resource.id, description=entity_description)
         for entity_description in ENTITY_DESCRIPTIONS
-        for resource in hub.api.garage_doors + hub.api.gates
+        for resource in [*hub.api.garage_doors.items, *hub.api.gates.items]
         if entity_description.supported_fn(hub, resource.id)
     ]
 
