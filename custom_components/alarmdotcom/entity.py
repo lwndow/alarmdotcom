@@ -211,6 +211,13 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
     def event_handler(self, message: pyadc.EventBrokerMessage) -> None:
         """Handle event message."""
 
+        log.debug(
+            "Event received for %s (%s): topic=%s",
+            self.resource_id,
+            self.__class__.__name__,
+            getattr(message, "topic", type(message).__name__),
+        )
+
         if message.topic in [
             pyadc.EventBrokerTopic.RESOURCE_ADDED,
             pyadc.EventBrokerTopic.RESOURCE_UPDATED,

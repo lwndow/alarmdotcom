@@ -49,6 +49,7 @@ ARM_AWAY = "arm_away"
 ARM_STAY = "arm_stay"
 ARM_NIGHT = "arm_night"
 STATE_TRANSITION_GRACE_PERIOD = timedelta(seconds=90)
+STATE_RESYNC_COOLDOWN = timedelta(minutes=2)
 
 
 async def async_setup_entry(
@@ -245,6 +246,7 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
         """Initialize the alarm control panel entity."""
 
         self._state_mismatch_started_at: datetime | None = None
+        self._last_resync_attempt_at: datetime | None = None
         super().__init__(hub, resource_id, description)
 
     def _validate_code(self, code: str | None) -> bool:
@@ -269,13 +271,14 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
         """Update entity state."""
 
         if isinstance(message, pyadc.ResourceEventMessage):
-            self._update_alarm_state()
+            self._update_alarm_state(message)
 
-    def _update_alarm_state(self) -> None:
+    def _update_alarm_state(self, message: pyadc.EventBrokerMessage | None = None) -> None:
         """Update the cached Home Assistant alarm state."""
 
         resource = self.hub.api.partitions[self.resource_id]
         actual_state = self.entity_description.state_fn(self.hub, self.resource_id)
+        message_topic = getattr(message, "topic", "manual")
 
         if actual_state is None:
             self._state_mismatch_started_at = None
@@ -293,6 +296,17 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
 
         self._attr_alarm_state = transition_state or actual_state
 
+        log.debug(
+            "Partition %s update via %s: adc_state=%s desired_state=%s ha_state=%s transition=%s mismatch_started=%s",
+            self.resource_id,
+            message_topic,
+            resource.attributes.state,
+            resource.attributes.desired_state,
+            actual_state,
+            transition_state,
+            self._state_mismatch_started_at,
+        )
+
     def _derive_transitional_state(
         self,
         adc_state: pyadc.partition.PartitionState,
@@ -309,6 +323,14 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             self._state_mismatch_started_at = now
 
         if now - self._state_mismatch_started_at > STATE_TRANSITION_GRACE_PERIOD:
+            log.warning(
+                "Partition %s state mismatch exceeded %s (adc_state=%s desired_state=%s); scheduling resync.",
+                self.resource_id,
+                STATE_TRANSITION_GRACE_PERIOD,
+                adc_state,
+                desired_state,
+            )
+            self._request_state_resync("state mismatch exceeded grace period")
             self._state_mismatch_started_at = None
             return None
 
@@ -323,6 +345,41 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             return AlarmControlPanelState.ARMING
 
         return None
+
+    def _request_state_resync(self, reason: str) -> None:
+        """Trigger a one-off full state fetch to correct potential desync."""
+
+        now = dt_util.utcnow()
+
+        if self._last_resync_attempt_at and now - self._last_resync_attempt_at < STATE_RESYNC_COOLDOWN:
+            log.debug(
+                "Partition %s resync skipped (cooldown active, last attempt at %s). Reason: %s",
+                self.resource_id,
+                self._last_resync_attempt_at,
+                reason,
+            )
+            return
+
+        self._last_resync_attempt_at = now
+
+        async def _do_resync() -> None:
+            try:
+                await self.hub.api.fetch_full_state()
+            except Exception as err:  # pragma: no cover - network/IO
+                log.warning(
+                    "Partition %s resync failed (%s): %s",
+                    self.resource_id,
+                    reason,
+                    err,
+                )
+            else:
+                log.info(
+                    "Partition %s resync requested (%s).",
+                    self.resource_id,
+                    reason,
+                )
+
+        self.hass.async_create_task(_do_resync())
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
