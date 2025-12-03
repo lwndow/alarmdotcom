@@ -25,6 +25,9 @@ from .const import (
 
 log = logging.getLogger(__name__)
 
+WS_STALE_THRESHOLD_SECONDS = 7 * 60  # Consider websocket stale after 7 minutes of silence.
+SAFETY_REFRESH_INTERVAL = timedelta(minutes=5)
+
 
 class AlarmHub:
     """Config-entry initiated Alarm Hub."""
@@ -134,7 +137,7 @@ class AlarmHub:
             async_track_time_interval(
                 self.hass,
                 self._refresh_if_stale,
-                timedelta(minutes=15),
+                SAFETY_REFRESH_INTERVAL,
             )
         )
 
@@ -174,6 +177,7 @@ class AlarmHub:
             pyadc.EventBrokerTopic.CONNECTION_EVENT,
         ]:
             self._last_event_ts = _now()
+            self.available = True
 
     async def _refresh_if_stale(self, *_: object) -> None:
         """Periodic safeguard: refresh state if websocket looks quiet or down."""
@@ -184,12 +188,20 @@ class AlarmHub:
 
         async with self._refresh_lock:
             now = _now()
-            # If we've never seen an event, or it's been > 20 minutes, refresh.
-            if self._last_event_ts is None or (now - self._last_event_ts) > (20 * 60):
-                log.info("Alarm.com websocket quiet for >20 minutes; running safety refresh.")
+            last_event_age = None if self._last_event_ts is None else now - self._last_event_ts
+
+            if self._last_event_ts is None or (last_event_age and last_event_age > WS_STALE_THRESHOLD_SECONDS):
+                log.info(
+                    "Alarm.com websocket quiet for %s; running safety refresh.",
+                    "unknown duration" if last_event_age is None else f"{last_event_age:.0f}s",
+                )
+
+                self.available = False
+
                 try:
                     await self.api.fetch_full_state()
-                    self._last_event_ts = now
+                    self._last_event_ts = _now()
+                    self.available = True
                 except Exception:  # noqa: BLE001 - log and continue
                     log.exception("Alarm.com safety refresh failed.")
 
@@ -236,6 +248,7 @@ async def _ws_state_handler(hub: "AlarmHub", message: pyadc.EventBrokerMessage) 
 
     # On (re)connect, mark the websocket as active to prevent unnecessary refreshes.
     hub._last_event_ts = asyncio.get_event_loop().time()
+    hub.available = True
 
 
 async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -177,6 +178,17 @@ class AdcLockEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], LockEntity):
 
     entity_description: AdcLockEntityDescription
 
+    def __init__(
+        self,
+        hub: AlarmHub,
+        resource_id: str,
+        description: AdcLockEntityDescription[AdcManagedDeviceT, AdcControllerT],
+    ) -> None:
+        """Initialize lock entity."""
+
+        self._post_command_task: asyncio.Task | None = None
+        super().__init__(hub, resource_id, description)
+
     def _validate_code(self, code: str | None) -> bool:
         arm_code = (
             self.hub.config_entry.options.get("arm_code")
@@ -187,6 +199,24 @@ class AdcLockEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], LockEntity):
             return True
         log.warning("Wrong code entered for lock %s.", self.resource_id)
         return False
+
+    def _schedule_post_command_refresh(self, reason: str, delay: float = 4.0) -> None:
+        """Queue a short-delayed full refresh after lock command."""
+
+        if self._post_command_task and not self._post_command_task.done():
+            return
+
+        async def _do_refresh() -> None:
+            try:
+                await asyncio.sleep(delay)
+                await self.hub.api.fetch_full_state()
+                self.hub._last_event_ts = asyncio.get_event_loop().time()
+                self.hub.available = True
+                log.info("Lock %s post-command refresh completed (%s).", self.resource_id, reason)
+            except Exception as err:  # pragma: no cover - network/IO
+                log.debug("Lock %s post-command refresh failed (%s): %s", self.resource_id, reason, err)
+
+        self._post_command_task = self.hass.async_create_task(_do_refresh())
 
     @callback
     def initiate_state(self) -> None:
@@ -230,6 +260,7 @@ class AdcLockEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], LockEntity):
             await self.entity_description.control_fn(
                 self.controller, self.resource_id, "lock"
             )
+            self._schedule_post_command_refresh("lock")
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Send unlock command."""
@@ -238,3 +269,4 @@ class AdcLockEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], LockEntity):
             await self.entity_description.control_fn(
                 self.controller, self.resource_id, "unlock"
             )
+            self._schedule_post_command_refresh("unlock")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from typing import Any, Callable
@@ -192,6 +193,22 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         raise ConfigEntryNotReady from ex
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    async def _handle_force_refresh(call) -> None:
+        """Manual service to fetch full state and mark websocket alive."""
+
+        try:
+            await hub.api.fetch_full_state()
+            hub._last_event_ts = asyncio.get_event_loop().time()
+            hub.available = True
+            LOGGER.info("Alarm.com manual refresh completed successfully.")
+        except Exception as err:  # pragma: no cover - network/IO
+            LOGGER.warning("Alarm.com manual refresh failed: %s", err)
+
+    hass.services.async_register(DOMAIN, "force_refresh", _handle_force_refresh)
+
+    # Ensure service is cleaned up with the hub.
+    hub.close_jobs.append(lambda: hass.services.async_remove(DOMAIN, "force_refresh"))
 
     async def handle_alarmdotcom_debug_request_event(event: Event) -> None:
         """Dump debug data when requested via Home Assistant event."""

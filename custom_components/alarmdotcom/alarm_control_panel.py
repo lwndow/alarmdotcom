@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import logging
 import re
@@ -247,6 +248,7 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
 
         self._state_mismatch_started_at: datetime | None = None
         self._last_resync_attempt_at: datetime | None = None
+        self._post_command_task: asyncio.Task | None = None
         super().__init__(hub, resource_id, description)
 
     def _validate_code(self, code: str | None) -> bool:
@@ -381,6 +383,24 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
 
         self.hass.async_create_task(_do_resync())
 
+    def _schedule_post_command_refresh(self, reason: str, delay: float = 6.0) -> None:
+        """Queue a short-delayed full refresh after a control command."""
+
+        if self._post_command_task and not self._post_command_task.done():
+            return
+
+        async def _do_refresh() -> None:
+            try:
+                await asyncio.sleep(delay)
+                await self.hub.api.fetch_full_state()
+                self.hub._last_event_ts = asyncio.get_event_loop().time()
+                self.hub.available = True
+                log.info("Partition %s post-command refresh completed (%s).", self.resource_id, reason)
+            except Exception as err:  # pragma: no cover - network/IO
+                log.debug("Partition %s post-command refresh failed (%s): %s", self.resource_id, reason, err)
+
+        self._post_command_task = self.hass.async_create_task(_do_refresh())
+
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
 
@@ -388,6 +408,7 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             await self.entity_description.control_fn(
                 self.hub, self.controller, self.resource_id, DISARM, {"code": code}
             )
+            self._schedule_post_command_refresh("disarm")
 
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         """Send arm home command."""
@@ -396,6 +417,7 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             await self.entity_description.control_fn(
                 self.hub, self.controller, self.resource_id, ARM_STAY, {"code": code}
             )
+            self._schedule_post_command_refresh("arm_home")
 
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
         """Send arm away command."""
@@ -404,6 +426,7 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             await self.entity_description.control_fn(
                 self.hub, self.controller, self.resource_id, ARM_AWAY, {"code": code}
             )
+            self._schedule_post_command_refresh("arm_away")
 
     async def async_alarm_arm_night(self, code: str | None = None) -> None:
         """Send arm night command."""
@@ -412,3 +435,4 @@ class AdcAlarmControlPanelEntity(AdcEntity[AdcManagedDeviceT, AdcControllerT], A
             await self.entity_description.control_fn(
                 self.hub, self.controller, self.resource_id, ARM_NIGHT, {"code": code}
             )
+            self._schedule_post_command_refresh("arm_night")
